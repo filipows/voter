@@ -61,9 +61,7 @@ var getMailnesiaInboxHtml = function (username) {
 var getConfirmationUrl = function (username) {
   return getMailnesiaInboxHtml(username)
     .then(getMailnesiaReceivedEmailHtml)
-    .then(function (receivedEmailHtml) {
-      return receivedEmailHtml.match('\"(https://.*token=.*)\"')[1];
-    });
+    .then((receivedEmailHtml) => receivedEmailHtml.match('\"(https://.*token=.*)\"')[1]);
 };
 
 var voteForBook = function (bookId) {
@@ -73,12 +71,8 @@ var voteForBook = function (bookId) {
   logger.info('voting by: ' + voterEmail);
 
   return rp(getVotingRequestOptions(bookId, voterEmail, votingUrl))
-    .then(function () {
-      fs.appendFileSync(filename, voterEmail + '\n');
-    })
-    .then(function () {
-      return username;
-    });
+    .then(() => fs.appendFileSync(filename, voterEmail + '\n'))
+    .then(() => username);
 };
 
 var confirmUrl = function (confirmationUrl) {
@@ -91,13 +85,13 @@ var confirmUrl = function (confirmationUrl) {
 };
 
 var getVoteAndConfirmAsyncFunctionForBook = function (bookId) {
-  return function(callback){
+  return function (callback) {
     voteForBook(bookId)
       .delay(2000)
       .then(getConfirmationUrl)
       .then(confirmUrl)
       .catch(callback)
-      .done(function () {
+      .done(() => {
         logger.info('done');
         callback(null);
       });
