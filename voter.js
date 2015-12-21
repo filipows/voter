@@ -1,13 +1,11 @@
 "use strict";
-
 var Chance = require('chance');
-var request = require('request');
 var logger = require('winston');
 var fs = require('fs');
 var cheerio = require('cheerio');
 var async = require('async');
 var _ = require('lodash');
-var Q = require('Q');
+var rp = require('request-promise');
 
 var chance = new Chance();
 
@@ -20,143 +18,99 @@ var getRandomMail = function () {
   return chance.name().replace(' ', '.').toLocaleLowerCase() + emailSuffix;
 };
 
+var getRequestOptionsForUrl = function (url) {
+  return {
+    url: url,
+    headers: {
+      'User-Agent': userAgent
+    }
+  };
+};
+
+var getVotingRequestOptions = function (bookId, voterEmail, votingUrl) {
+  var formData = {
+    Email: voterEmail,
+    BookID: bookId,
+    UserID: 0
+  };
+
+  return {
+    url: votingUrl,
+    method: "POST",
+    headers: {
+      "X-Requested-With": "XMLHttpRequest"
+    },
+    form: formData,
+    followAllRedirects: true
+  };
+};
+
+var getMailnesiaReceivedEmailHtml = function (inboxHtml) {
+  var $ = cheerio.load(inboxHtml);
+  var emailRelativePath = $('body > table > tbody > tr > td:nth-child(2) > a').attr('href');
+
+  return rp(getRequestOptionsForUrl('http://mailnesia.com' + emailRelativePath));
+};
+
+var getMailnesiaInboxHtml = function (username) {
+  var mailnesiaUsernameInboxReqestOptions = getRequestOptionsForUrl('http://mailnesia.com/mailbox/' + username);
+
+  return rp(mailnesiaUsernameInboxReqestOptions);
+};
+
+var getConfirmationUrl = function (username) {
+  return getMailnesiaInboxHtml(username)
+    .then(getMailnesiaReceivedEmailHtml)
+    .then(function (receivedEmailHtml) {
+      return receivedEmailHtml.match('\"(https://.*token=.*)\"')[1];
+    });
+};
+
+var voteForBook = function (bookId) {
+  var votingUrl = votingApi + bookId;
+  var voterEmail = getRandomMail();
+  var username = voterEmail.match("(.*)" + emailSuffix + "$")[1];
+  logger.info('voting by: ' + voterEmail);
+
+  return rp(getVotingRequestOptions(bookId, voterEmail, votingUrl))
+    .then(function () {
+      fs.appendFileSync(filename, voterEmail + '\n');
+    })
+    .then(function () {
+      return username;
+    });
+};
+
+var confirmUrl = function (confirmationUrl) {
+  logger.info('confirming with URL: ' + confirmationUrl);
+
+  return rp({
+    url: confirmationUrl,
+    followAllRedirects: true
+  });
+};
+
+var getVoteAndConfirmAsyncFunctionForBook = function (bookId) {
+  return function(callback){
+    voteForBook(bookId)
+      .delay(2000)
+      .then(getConfirmationUrl)
+      .then(confirmUrl)
+      .catch(callback)
+      .done(function () {
+        logger.info('done');
+        callback(null);
+      });
+  }
+};
+
+
 class Voter {
-  constructor(){}
-  vote(bookId, numberOfVotes, concurrentRequests){
-    const votingUrl = votingApi + bookId;
+  constructor() {}
 
-    var getMailnesiaReceivedEmailHtml = function (inboxHtml) {
-      var deferred = Q.defer();
-
-      var $ = cheerio.load(inboxHtml);
-      var emailRelativePath = $('body > table > tbody > tr > td:nth-child(2) > a').attr('href');
-
-      var mailnesiaReceivedEmailRequestOptions = {
-        url: 'http://mailnesia.com' + emailRelativePath,
-        headers: {
-          'User-Agent': userAgent
-        }
-      };
-
-      request(mailnesiaReceivedEmailRequestOptions, function (err, response, body) {
-        if (!err) {
-          deferred.resolve(body);
-        } else {
-          deferred.reject(err);
-        }
-      });
-
-      return deferred.promise;
-    };
-
-    var getMailnesiaInboxHtml = function (username) {
-      var deferred = Q.defer();
-
-      var mailnesiaUsernameInboxReqestOptions = {
-        url: 'http://mailnesia.com/mailbox/' + username,
-        headers: {
-          'User-Agent': userAgent
-        }
-      };
-
-      request(mailnesiaUsernameInboxReqestOptions, function (err, response, body) {
-        if (!err) {
-          deferred.resolve(body);
-        } else {
-          logger.error('Problem with retrieving mailnesia inbox html for: ' + username);
-          deferred.reject(err);
-        }
-      });
-
-      return deferred.promise;
-    };
-
-    var getConfirmationUrl = function (username) {
-      var deferred = Q.defer();
-
-      getMailnesiaInboxHtml(username)
-        .then(getMailnesiaReceivedEmailHtml)
-        .then(function (receivedEmailHtml) {
-          var confirmUrl = receivedEmailHtml.match('\"(https://.*token=.*)\"')[1];
-          deferred.resolve(confirmUrl);
-        }, function (error) {
-          logger.error("Couldn't receive confirmation url. Possible captcha.");
-          deferred.reject(error);
-        });
-
-
-      return deferred.promise;
-    };
-
-    var randomVote = function () {
-      var deferred = Q.defer();
-      var voterEmail = getRandomMail();
-      var username = voterEmail.match("(.*)" + emailSuffix + "$")[1];
-      logger.info('voting by: ' + voterEmail);
-
-      var formData = {
-        Email: voterEmail,
-        BookID: bookId,
-        UserID: 0
-      };
-      var options = {
-        url: votingUrl,
-        method: "POST",
-        headers: {
-          "X-Requested-With": "XMLHttpRequest"
-        },
-        form: formData,
-        followAllRedirects: true
-      };
-
-      request(options, function (err, response, body) {
-        if (err) {
-          logger.error('There was a problem with submitting email: ' + voterEmail + ' for voting.')
-          deferred.reject(err);
-        } else {
-          fs.appendFileSync(filename, voterEmail + '\n');
-          deferred.resolve(username);
-        }
-      });
-
-      return deferred.promise;
-    };
-
-    var confirmUrl = function (confirmationUrl) {
-      logger.info('confirming with URL: ' + confirmationUrl);
-      var deferred = Q.defer();
-
-      var confirmationUrlRequestOptions = {
-        url: confirmationUrl,
-        followAllRedirects: true
-      };
-
-      request.get(confirmationUrlRequestOptions, function (err, request, body) {
-        if (err) {
-          logger.error('Problem with confirming vote.');
-          deferred.reject(err);
-        } else {
-          deferred.resolve();
-        }
-      });
-
-      return deferred.promise;
-    };
-
-    var voteAndConfirm = function (callback) {
-      return randomVote()
-        .delay(2000)
-        .then(getConfirmationUrl)
-        .then(confirmUrl)
-        .catch(callback)
-        .done(function () {
-          logger.info('done');
-          callback(null);
-        });
-    };
-
-
-    async.parallelLimit(_.fill(Array(numberOfVotes), voteAndConfirm), concurrentRequests);
+  vote(bookId, numberOfVotes, numberOfConcurrentRequests) {
+    var voteAndConfirmAsyncFunction = getVoteAndConfirmAsyncFunctionForBook(bookId);
+    async.parallelLimit(_.fill(Array(numberOfVotes), voteAndConfirmAsyncFunction), numberOfConcurrentRequests);
   }
 }
 
