@@ -5,6 +5,7 @@ var fs = require('fs');
 var cheerio = require('cheerio');
 var async = require('async');
 var _ = require('lodash');
+var Q = require('Q');
 
 var chance = new Chance();
 
@@ -18,25 +19,12 @@ var getRandomMail = function () {
   return chance.name().replace(' ', '.').toLocaleLowerCase() + emailSuffix;
 };
 
-var getMailnesiaInboxHtml = function (username, cb) {
-  var mailnesiaUsernameInboxReqestOptions = {
-    url: 'http://mailnesia.com/mailbox/' + username,
-    headers: {
-      'User-Agent': userAgent
-    }
-  };
+var getMailnesiaReceivedEmailHtml = function (inboxHtml) {
+  var deferred = Q.defer();
 
-  request(mailnesiaUsernameInboxReqestOptions, function (err, response, body) {
-    if (!err) {
-      cb(null, body);
-    } else {
-      logger.error('Problem with retrieving mailnesia inbox html for: ' + username);
-      cb(err);
-    }
-  });
-};
+  $ = cheerio.load(inboxHtml);
+  var emailRelativePath = $('body > table > tbody > tr > td:nth-child(2) > a').attr('href');
 
-var getMailnesiaReceivedEmailHtml = function (emailRelativePath, cb) {
   var mailnesiaReceivedEmailRequestOptions = {
     url: 'http://mailnesia.com' + emailRelativePath,
     headers: {
@@ -46,58 +34,59 @@ var getMailnesiaReceivedEmailHtml = function (emailRelativePath, cb) {
 
   request(mailnesiaReceivedEmailRequestOptions, function (err, response, body) {
     if (!err) {
-      cb(null, body);
+      deferred.resolve(body);
     } else {
-      cb(err);
+      deferred.reject(err);
     }
   });
 
+  return deferred.promise;
 };
 
-var getConfirmUrl = function (username, cb) {
-  getMailnesiaInboxHtml(username, function (err, html) {
+var getMailnesiaInboxHtml = function (username) {
+  var deferred = Q.defer();
+
+  var mailnesiaUsernameInboxReqestOptions = {
+    url: 'http://mailnesia.com/mailbox/' + username,
+    headers: {
+      'User-Agent': userAgent
+    }
+  };
+
+  request(mailnesiaUsernameInboxReqestOptions, function (err, response, body) {
     if (!err) {
-      $ = cheerio.load(html);  //todo captcha validation
-      var emailHref = $('body > table > tbody > tr > td:nth-child(2) > a').attr('href');
-
-      getMailnesiaReceivedEmailHtml(emailHref, function (err, html) {
-        if (!err) {
-          var confirmUrl = html.match('\"(https://.*token=.*)\"')[1];
-          cb(null, confirmUrl);
-        } else {
-          logger.error('There was a problem with opening mailnesia received email: ' + username);
-          cb(err);
-        }
-      });
-    }
-  });
-};
-
-var confirmVoting = function (username, cb) {
-  getConfirmUrl(username, function (err, confirmUrl) {
-    if (err) {
-      logger.error('Problem with receiving confirm url.');
-      cb(err);
+      deferred.resolve(body);
     } else {
-      request.get({
-        url: confirmUrl,
-        followAllRedirects: true
-      }, function (err, request, body) {
-        if (err) {
-          logger.error('Problem with confirming vote.');
-          cb(err);
-        } else {
-          cb(null, username);
-        }
-      });
+      logger.error('Problem with retrieving mailnesia inbox html for: ' + username);
+      deferred.reject(err);
     }
   });
+
+  return deferred.promise;
 };
 
-var randomVote = function (cb) {
-  console.log('voting...');
+var getConfirmationUrl = function (username) {
+  var deferred = Q.defer();
+
+  getMailnesiaInboxHtml(username)
+    .then(getMailnesiaReceivedEmailHtml)
+    .then(function (receivedEmailHtml) {
+      var confirmUrl = receivedEmailHtml.match('\"(https://.*token=.*)\"')[1];
+      deferred.resolve(confirmUrl);
+    }, function (error) {
+      logger.error("Couldn't receive confirmation url. Possible captcha.");
+      deferred.reject(error);
+    });
+
+
+  return deferred.promise;
+};
+
+var randomVote = function () {
+  var deferred = Q.defer();
   var voterEmail = getRandomMail();
   var username = voterEmail.match("(.*)" + emailSuffix + "$")[1];
+  logger.info('voting by: ' + voterEmail);
 
   var formData = {
     Email: voterEmail,
@@ -117,27 +106,48 @@ var randomVote = function (cb) {
   request(options, function (err, response, body) {
     if (err) {
       logger.error('There was a problem with submitting email: ' + voterEmail + ' for voting.')
-      cb(err);
+      deferred.reject(err);
     } else {
-      setTimeout(function () {
-          confirmVoting(username, cb)
-        }, 2000);
+      fs.appendFileSync(filename, voterEmail + '\n');
+      deferred.resolve(username);
     }
   });
+
+  return deferred.promise;
 };
 
+var confirmUrl = function (confirmationUrl) {
+  logger.info('confirming with URL: ' + confirmationUrl);
+  var deferred = Q.defer();
+
+  var confirmationUrlRequestOptions = {
+    url: confirmationUrl,
+    followAllRedirects: true
+  };
+
+  request.get(confirmationUrlRequestOptions, function (err, request, body) {
+    if (err) {
+      logger.error('Problem with confirming vote.');
+      deferred.reject(err);
+    } else {
+      deferred.resolve();
+    }
+  });
+
+  return deferred.promise;
+};
 
 const NUMBER_OF_VOTES = 10;
-var asyncFunction = function(cb){
-  randomVote(function (err, votingUsername) {
-    if (err) {
-      logger.error(err);
-      cb(err);
-    } else {
-      fs.appendFileSync(filename, votingUsername + '\n');
-      logger.info('Succesfully voted by username: ' + votingUsername);
-      cb(null, votingUsername);
-    }
-  });
+var voteAndConfirm = function (callback) {
+  return randomVote()
+    .delay(2000)
+    .then(getConfirmationUrl)
+    .then(confirmUrl)
+    .catch(callback)
+    .done(function () {
+      logger.info('done');
+      callback(null);
+    });
 };
-async.parallelLimit(_.fill(Array(NUMBER_OF_VOTES), asyncFunction), 3);
+
+async.parallelLimit(_.fill(Array(NUMBER_OF_VOTES), voteAndConfirm), 1);
